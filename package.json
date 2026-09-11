@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "ingest": "tsx scripts/ingesta.ts"
+    "ingest": "tsx scripts/ingesta.ts",
+    "test:retriever": "tsx scripts/test-retriever.ts",
+    "test:chat": "tsx scripts/test-chat.ts"
   },
   "dependencies": {
     "@langchain/community": "^1.1.29",
