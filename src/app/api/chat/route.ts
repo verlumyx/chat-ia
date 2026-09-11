@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { preguntar, streamPreguntar } from "@/lib/rag";
+import { preguntar, streamPreguntar, formatearErrorGemini } from "@/lib/rag";
 
 export const runtime = "nodejs"; // Requerido para LangChain y Supabase
 
@@ -54,11 +54,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ respuesta });
   } catch (error) {
     console.error("Error en /api/chat:", error);
-    const mensajeError =
-      error instanceof Error ? error.message : "Error interno del servidor";
+    const mensajeAmigable = formatearErrorGemini(error);
     return NextResponse.json(
-      { error: "Error al procesar la consulta", details: mensajeError },
-      { status: 500 }
+      { error: "Aviso del servicio", details: mensajeAmigable },
+      { status: 200 }
     );
   }
 }

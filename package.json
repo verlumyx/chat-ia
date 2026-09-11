@@ -9,7 +9,8 @@
     "lint": "eslint",
     "ingest": "tsx scripts/ingesta.ts",
     "test:retriever": "tsx scripts/test-retriever.ts",
-    "test:chat": "tsx scripts/test-chat.ts"
+    "test:chat": "tsx scripts/test-chat.ts",
+    "test:tools": "tsx scripts/test-tools.ts"
   },
   "dependencies": {
     "@langchain/community": "^1.1.29",
@@ -19,7 +20,8 @@
     "langchain": "^1.5.11",
     "next": "16.3.4",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

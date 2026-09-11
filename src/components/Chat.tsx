@@ -23,7 +23,7 @@ const SUGGESTIONS = [
   "¿Cuáles son las políticas de vacaciones y días libres?",
   "¿En qué consiste el onboarding durante la primera semana?",
   "¿Qué equipamiento y estipendio remoto provee la empresa?",
-  "¿Cuáles son los canales y horarios de soporte técnico?",
+  "¿Cuál es el salario de un Ingeniero de IA y quién ocupa el cargo?",
 ];
 
 const INITIAL_CONVERSATION: Conversation = {
@@ -191,6 +191,31 @@ export default function Chat() {
           throw new Error(errorMsg);
         }
 
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const json = await res.json().catch(() => null);
+          const replyText =
+            json?.respuesta ||
+            json?.details ||
+            json?.error ||
+            "No se obtuvo respuesta del servidor.";
+
+          setConversations((prev) =>
+            prev.map((conv) => {
+              if (conv.id === activeId) {
+                return {
+                  ...conv,
+                  messages: conv.messages.map((m) =>
+                    m.id === assistantMessage.id ? { ...m, content: replyText } : m
+                  ),
+                };
+              }
+              return conv;
+            })
+          );
+          return;
+        }
+
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
 
@@ -216,8 +241,19 @@ export default function Chat() {
           );
         }
       } catch (error) {
-        const detail =
+        const rawDetail =
           error instanceof Error ? error.message : "Error desconocido";
+        const isQuota =
+          rawDetail.includes("429") ||
+          rawDetail.toLowerCase().includes("quota") ||
+          rawDetail.toLowerCase().includes("too many requests");
+
+        const cleanMessage = isQuota
+          ? "⏳ Se alcanzó temporalmente el límite de consultas por minuto de la cuenta gratuita de Gemini. Por favor espera unos segundos y vuelve a intentar."
+          : rawDetail.startsWith("⏳") || rawDetail.startsWith("⚠️")
+          ? rawDetail
+          : `⚠️ No fue posible obtener respuesta: ${rawDetail}`;
+
         setConversations((prev) =>
           prev.map((conv) => {
             if (conv.id === activeId) {
@@ -225,7 +261,7 @@ export default function Chat() {
                 ...conv,
                 messages: conv.messages.map((m) =>
                   m.id === assistantMessage.id
-                    ? { ...m, content: `⚠️ No pude obtener respuesta: ${detail}` }
+                    ? { ...m, content: cleanMessage }
                     : m
                 ),
               };
