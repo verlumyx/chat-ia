@@ -1,21 +1,19 @@
-# 🤖 chatIA — Asistente Corporativo con RAG Híbrido y Tools
+# 🤖 chatIA — Asistente Corporativo con RAG Híbrido, Tools y WhatsApp Desacoplado
 
-**chatIA** es un asistente de inteligencia artificial fullstack construido con **Next.js (App Router)**, **LangChain.js**, **Google Gemini** y **Supabase** (PostgreSQL + `pgvector`). 
+**chatIA** es un asistente de inteligencia artificial fullstack construido con **Next.js (App Router)**, **LangChain.js**, **Google Gemini**, **Supabase** (PostgreSQL + `pgvector`) y la **WhatsApp Cloud API** de Meta.
 
-Combina **búsqueda semántica no estructurada (RAG)** sobre repositorios de documentos Markdown (`.md`) con **consultas estructuradas a bases de datos relacionales** mediante *Function Calling (Tools)*, manteniendo un estricto control de acceso y seguridad.
+Combina **búsqueda semántica no estructurada (RAG)** sobre repositorios de documentos Markdown (`.md`) con **consultas estructuradas a bases de datos relacionales** mediante *Function Calling (Tools)*, integrando tanto una interfaz web interactiva con streaming de tokens como un canal oficial de **WhatsApp con arquitectura de cola durable desacoplada y workers en segundo plano**.
 
 ---
 
-## 🎯 Propósito del Proyecto
+## 🎯 Propósito y Características Principales
 
-El objetivo de este proyecto es implementar una arquitectura moderna, escalable y segura para asistentes conversacionales corporativos:
-
-1. **RAG sin Alucinaciones:** Responder preguntas sobre documentación interna (políticas laborales, manuales de onboarding, guías técnicas) basándose exclusivamente en fragmentos reales recuperados por similitud vectorial (`temperature: 0`).
-2. **Arquitectura Híbrida (RAG + SQL Tools):** Permitir al modelo consultar información relacional en tiempo real (directorio de empleados, cargos, departamentos y salarios) mediante herramientas (*Tools*) tipadas con Zod.
-3. **Seguridad y Menor Privilegio:** Aislar tablas confidenciales (como `clientes` y estados de cuenta), impidiendo cualquier acceso o fuga de información sensible tanto por prompts maliciosos como por alucinaciones.
-4. **Resiliencia de Cuotas (Multi-Model Fallback):** Conmutación automática entre modelos Gemini (`gemini-flash-latest`, `gemini-3.5-flash`, `gemini-3.7-flash`, etc.) para evitar bloqueos por límites de cuota (HTTP 429) de la capa gratuita.
-5. **Experiencia de Usuario en Tiempo Real:** Chat web con streaming de tokens palabra por palabra y panel lateral para gestionar múltiples conversaciones persistidas en `localStorage`.
-6. **Canal Multicanal (Listo para WhatsApp):** Diseñado con separación desacoplada entre ingesta y consulta para conectar tanto la web como webhooks de WhatsApp al mismo motor.
+1. **RAG sin Alucinaciones:** Respuestas a preguntas sobre políticas laborales, onboarding y guías técnicas basadas exclusivamente en fragmentos reales recuperados por similitud vectorial (`temperature: 0`).
+2. **Arquitectura Híbrida (RAG + SQL Tools):** Consultas en tiempo real a tablas de negocio (directorio de empleados, roles y salarios) mediante herramientas (*Tools*) tipadas con Zod.
+3. **Seguridad y Menor Privilegio:** Aislamiento total de tablas confidenciales (como `clientes`), impidiendo cualquier fuga de información frente a *prompt injections*.
+4. **Resiliencia de Cuotas (Multi-Model Fallback):** Conmutación automática entre modelos Gemini (`gemini-flash-latest`, `gemini-3.5-flash`, `gemini-3.7-flash`) para evitar bloqueos por límites de cuota (HTTP 429).
+5. **Experiencia Web en Tiempo Real:** Chat web con *streaming* palabra por palabra y panel lateral de conversaciones persistidas.
+6. **Integración WhatsApp de Alta Resiliencia:** Webhook desacoplado con respuesta `200 OK` inmediata (<50ms), persistencia en cola durable (`webhook_queue`), control de idempotencia contra reintentos de Meta y procesamiento asíncrono con **Worker** y *Dead Letter Queue (DLQ)*.
 
 ---
 
@@ -26,13 +24,15 @@ El objetivo de este proyecto es implementar una arquitectura moderna, escalable 
 | **Framework Web** | [Next.js](https://nextjs.org/) (App Router, React 19) | Frontend, UI de chat y API Routes en runtime Node.js |
 | **Estilos** | [Tailwind CSS v4](https://tailwindcss.com/) | Interfaz responsive, moderna y con modo oscuro |
 | **Orquestación IA** | [LangChain.js](https://js.langchain.com/) | Cadenas RAG, vector stores, prompt templates y tools |
-| **Modelos LLM & Embeddings** | [Google Gemini](https://ai.google.dev/) (`gemini-flash-latest`, `gemini-embedding-001`) | Generación de respuestas fácticas y cálculo de vectores (768 dimensiones) |
-| **Base Vectorial y Relacional** | [Supabase](https://supabase.com/) (PostgreSQL + `pgvector`) | Almacenamiento vectorial (`documents`) y tablas de negocio (`roles`, `empleados`, `clientes`) |
-| **Validación de Esquemas** | [Zod](https://zod.dev/) | Tipado y esquemas de parámetros para Function Calling |
+| **Modelos LLM & Embeddings** | [Google Gemini](https://ai.google.dev/) (`gemini-flash-latest`, `gemini-embedding-001`) | Respuestas fácticas y cálculo de vectores (768 dimensiones fijas) |
+| **Base de Datos & VectorStore** | [Supabase](https://supabase.com/) (PostgreSQL + `pgvector`) | Almacenamiento vectorial (`documents`), tablas relacionales y cola durable (`webhook_queue`) |
+| **Canal Móvil** | [WhatsApp Cloud API](https://developers.facebook.com/) (Graph API v21.0) | Recepción de eventos por webhook y envío de mensajes salientes |
+| **Concurrencia en Cola** | PostgreSQL `FOR UPDATE SKIP LOCKED` | Desencolado seguro entre múltiples workers concurrentes |
+| **Validación de Esquemas** | [Zod](https://zod.dev/) | Tipado de parámetros y validación de Function Calling |
 
 ---
 
-## 🏗️ Arquitectura del Sistema
+## 🏗️ Arquitectura General del Sistema
 
 ```
   ┌─ INGESTA OFFLINE (scripts/ingesta.ts) ──────────────────────────────────┐
@@ -45,14 +45,24 @@ El objetivo de este proyecto es implementar una arquitectura moderna, escalable 
                                                        │   - roles (SQL)        │
                                                        │   - empleados (SQL)    │
                                                        │   - clientes (BLOCKED) │
+                                                       │   - webhook_queue      │
                                                        └────────────────────────┘
-                                                              ▲          ▲
-  ┌─ CONSULTA EN VIVO (/api/chat) ────────────────────────────│──────────│──────┐
-  │                                                           │          │      │
-  │   Usuario ──▶  Gemini (Cerebro) ──▶ ¿Documentos? ──▶ Retriever       │      │
-  │                     │           ──▶ ¿Sueldos/Roles? ──▶ Tool SQL ────┘      │
+                                                               ▲          ▲
+   CANAL 1: CHAT WEB (Streaming en Vivo)                      │          │
+  ┌───────────────────────────────────────────────────────────│──────────│──────┐
+  │ Usuario ──▶ Next.js (/api/chat) ──▶ Gemini ──▶ Retriever ─┘          │      │
+  │                     │                 └───▶ Tool SQL ────────────────┘      │
   │                     ▼                                                       │
-  │             Streaming de respuesta al Chat Web                              │
+  │             Streaming de tokens en tiempo real al navegador                 │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+   CANAL 2: WHATSAPP EMPRESARIAL (Cola Asíncrona & Worker)
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ 1. Usuario WhatsApp ──▶ Meta Cloud API ──▶ Webhook (/api/whatsapp)          │
+  │ 2. Webhook: Guarda en webhook_queue ──▶ Retorna HTTP 200 a Meta (<50ms)    │
+  │ 3. Worker (scripts/worker.ts): Desencola con FOR UPDATE SKIP LOCKED         │
+  │    └──▶ Pregunta al Cerebro RAG + Tools                                     │
+  │    └──▶ Despacha respuesta vía Meta Graph API (POST /messages)              │
   └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -61,9 +71,10 @@ El objetivo de este proyecto es implementar una arquitectura moderna, escalable 
 ## 📋 Requisitos Previos
 
 - **Node.js** v20+ o v22+
-- **NPM** o gestor de paquetes preferido
-- Una cuenta gratuita en [Google AI Studio](https://aistudio.google.com/app/apikey) para obtener tu `GOOGLE_API_KEY`.
-- Un proyecto en [Supabase](https://supabase.com/) para la base de datos Postgres y extensión vectorial.
+- **NPM** o gestor de paquetes de tu preferencia
+- Cuenta en [Google AI Studio](https://aistudio.google.com/app/apikey) para tu `GOOGLE_API_KEY`.
+- Proyecto en [Supabase](https://supabase.com/) con PostgreSQL y extensión `pgvector`.
+- Cuenta en [Meta for Developers](https://developers.facebook.com/) con una app de WhatsApp configurada.
 
 ---
 
@@ -72,59 +83,82 @@ El objetivo de este proyecto es implementar una arquitectura moderna, escalable 
 ### 1. Clonar el repositorio e instalar dependencias
 
 ```bash
-git clone <url-del-repositorio>
+git clone https://github.com/verlumyx/chat-ia.git
 cd chatIA
 npm install
 ```
 
 ### 2. Configurar variables de entorno
 
-Crea un archivo `.env` o `.env.local` en la raíz del proyecto tomando como referencia `.env.example`:
+Copia `.env.example` a `.env`:
 
-```env
-GOOGLE_API_KEY=tu_clave_de_google_ai_studio
-SUPABASE_URL=https://tu-proyecto.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=tu_service_role_key_secreta
+```bash
+cp .env.example .env
 ```
 
-> ⚠️ **Nota de seguridad:** La clave `SUPABASE_SERVICE_ROLE_KEY` solo se ejecuta en el servidor y nunca se expone al cliente.
+Configura tus credenciales:
+
+```env
+# Gemini AI
+GOOGLE_API_KEY=tu_clave_de_google_ai_studio
+
+# Supabase
+SUPABASE_URL=https://tu-proyecto.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=tu_service_role_key_secreta
+
+# WhatsApp Cloud API
+WHATSAPP_VERIFY_TOKEN=tu_token_de_verificacion_webhook
+WHATSAPP_ACCESS_TOKEN=tu_token_de_meta_graph_api
+WHATSAPP_PHONE_NUMBER_ID=tu_phone_number_id
+```
 
 ### 3. Configurar la Base de Datos en Supabase
 
-Abre el **SQL Editor** en el panel de tu proyecto de Supabase y ejecuta los siguientes scripts:
+Abre el **SQL Editor** en tu panel de Supabase y ejecuta en orden los siguientes scripts:
 
-1. **Extensión vectorial y tablas RAG:** Ejecuta el script de [`docs/tablas-supabase.md`](docs/tablas-supabase.md) para habilitar `vector`, crear la tabla `documents` y la función `match_documents`.
-2. **Tablas de negocio y datos de prueba:** Ejecuta el contenido de [`scripts/crear-tablas-negocio.sql`](scripts/crear-tablas-negocio.sql) para crear `roles`, `empleados` y `clientes`.
+1. **Extensión vectorial y tabla RAG:** Ejecuta las sentencias de [`docs/tablas-supabase.md`](docs/tablas-supabase.md) (creación de `documents` y función `match_documents`).
+2. **Tablas de negocio y datos de prueba:** Ejecuta [`scripts/crear-tablas-negocio.sql`](scripts/crear-tablas-negocio.sql) (tablas `roles`, `empleados` y `clientes`).
+3. **Cola durable de Webhooks:** Ejecuta [`scripts/crear-tabla-cola.sql`](scripts/crear-tabla-cola.sql) (crea `webhook_queue` y la función RPC `dequeue_webhook_event`).
 
-### 4. Ejecutar la Ingesta de Documentos Markdown (Fase 1)
+### 4. Ingesta de Documentos Markdown
 
-Para trocear los archivos de la carpeta `data/` y generar sus embeddings en Supabase:
+Procesa y genera los embeddings de la carpeta `data/` en Supabase:
 
 ```bash
 npm run ingest
 ```
 
-### 5. Iniciar la aplicación en modo desarrollo
+### 5. Iniciar la Aplicación
 
+#### Modo Desarrollo Web
 ```bash
 npm run dev
 ```
+Abre [http://localhost:3000](http://localhost:3000) para acceder a la interfaz de chat interactiva.
 
-Abre [http://localhost:3000](http://localhost:3000) en tu navegador para interactuar con la interfaz de chat.
+#### Worker de WhatsApp en Segundo Plano
+En una terminal secundaria, arranca el consumidor de la cola para procesar los mensajes de WhatsApp:
+```bash
+npm run worker
+```
 
 ---
 
 ## 🧪 Scripts de Prueba y Verificación
 
-El proyecto incluye suites de prueba automatizadas para cada una de las fases:
+El proyecto incluye comandos dedicados para validar cada capa del sistema:
 
 | Comando | Descripción |
 |---|---|
-| `npm run test:retriever` | Prueba la búsqueda vectorial (Fase 2) recuperando chunks relevantes sin tocar los `.md`. |
-| `npm run test:chat` | Valida la chain RAG, el endpoint `/api/chat` en modo JSON y con streaming. |
-| `npm run test:tools` | Verifica la ejecución de la Tool `consultar_empleados_y_roles` y comprueba que se rechacen consultas a `clientes`. |
-| `npm run lint` | Ejecuta ESLint para validar la calidad del código. |
-| `npm run build` | Compila la aplicación para producción con Turbopack. |
+| `npm run worker` | Inicia el worker continuo en segundo plano para procesar la cola de WhatsApp. |
+| `npm run queue:reconcile` | Busca y reintenta eventos pendientes o fallidos antiguos (reconciliación durable). |
+| `npm run test:queue` | Ejecuta la suite de pruebas de cola: idempotencia, inserción concurrente y reintentos. |
+| `npm run test:whatsapp` | Prueba el envío directo de mensajes a WhatsApp a través de la Graph API de Meta. |
+| `npm run test:retriever` | Valida la búsqueda semántica recuperando fragmentos relevantes de `documents`. |
+| `npm run test:chat` | Valida la cadena RAG y el endpoint `/api/chat` en modo JSON y streaming. |
+| `npm run test:tools` | Verifica el Function Calling a `roles`/`empleados` y comprueba el bloqueo de `clientes`. |
+| `npm run lint` | Ejecuta ESLint sobre el proyecto. |
+| `npm run build` | Compila la aplicación para producción. |
 
 ---
 
@@ -132,48 +166,68 @@ El proyecto incluye suites de prueba automatizadas para cada una de las fases:
 
 ```text
 chatIA/
-├── data/                          # Documentos Markdown fuente (.md)
+├── data/                                # Documentos Markdown fuente (.md)
 │   ├── onboarding.md
 │   ├── politicas-empresa.md
 │   └── soporte-tecnico.md
-├── docs/                          # Documentación arquitectónica y guías
-│   ├── arquitectura-rag-y-tools.md
-│   ├── ejercicio-chat-md-nextjs-whatsapp.md
-│   ├── seguridad-control-acceso.md
-│   └── tablas-supabase.md
-├── scripts/                       # Scripts ejecutables con tsx
-│   ├── crear-tablas-negocio.sql   # DDL SQL de negocio
-│   ├── ingesta.ts                 # Script de ingesta offline RAG
-│   ├── test-chat.ts               # Test de endpoint y streaming
-│   ├── test-retriever.ts          # Test del retriever de Supabase
-│   └── test-tools.ts              # Test de tools y seguridad
+├── docs/                                # Documentación arquitectónica completa
+│   ├── arquitectura-chatbot-whatsapp.md # Guía integral de configuración de WhatsApp
+│   ├── arquitectura-rag-y-tools.md      # Diseño de la arquitectura RAG + Tools SQL
+│   ├── cola.md                          # Principios de fiabilidad y diseño de colas
+│   ├── despliegue-vercel.md             # Guía de despliegue en Vercel y background workers
+│   ├── ejercicio-chat-md-nextjs-whatsapp.md # Enunciado original del proyecto
+│   ├── flujo-completo-chat.md           # Flujo paso a paso Web y WhatsApp
+│   ├── seguridad-control-acceso.md      # Defensa en profundidad y bloqueo de clientes
+│   └── tablas-supabase.md               # Esquemas DDL de base de datos y funciones RPC
+├── scripts/                             # Scripts ejecutables con tsx
+│   ├── crear-tabla-cola.sql             # DDL de la cola webhook_queue y RPC
+│   ├── crear-tablas-negocio.sql         # DDL de roles, empleados y clientes
+│   ├── ingesta.ts                       # Ingesta offline de Markdown a pgvector
+│   ├── reconciliar-cola.ts              # Script de reconciliación de eventos pendientes
+│   ├── test-chat.ts                     # Pruebas del chat RAG
+│   ├── test-queue.ts                    # Pruebas de cola e idempotencia
+│   ├── test-retriever.ts                # Pruebas del retriever vectorial
+│   ├── test-tools.ts                    # Pruebas de Function Calling y seguridad
+│   ├── test-whatsapp.ts                 # Pruebas de envío por WhatsApp Cloud API
+│   └── worker.ts                        # Worker continuo en segundo plano
 ├── src/
 │   ├── app/
-│   │   ├── api/chat/route.ts      # Endpoint serverless /api/chat (Node runtime)
-│   │   ├── layout.tsx             # Layout raíz
-│   │   └── page.tsx               # Página principal del chat
+│   │   ├── api/chat/route.ts            # Endpoint web síncrono con streaming
+│   │   ├── api/whatsapp/route.ts        # Webhook asíncrono con respuesta inmediata 200
+│   │   ├── api/worker/process/route.ts  # Endpoint serverless de procesamiento por lotes
+│   │   ├── layout.tsx                   # Layout global
+│   │   └── page.tsx                     # Página principal con interfaz de chat
 │   ├── components/
-│   │   ├── Chat.tsx               # Interfaz de chat, estado y streaming
-│   │   ├── ChatMessage.tsx        # Renderizado de burbujas de mensaje
-│   │   └── Sidebar.tsx            # Barra lateral de historial de conversaciones
+│   │   ├── Chat.tsx                     # Interfaz de usuario interactiva
+│   │   ├── ChatMessage.tsx              # Componente de burbuja de mensaje
+│   │   └── Sidebar.tsx                  # Barra lateral de conversaciones
 │   └── lib/
-│       ├── embeddings.ts          # Clase GeminiEmbeddings (768 dims fija)
-│       ├── rag.ts                 # Retriever, chain RAG y conmutación de modelos
-│       └── tools.ts               # Herramientas LangChain para tablas SQL
+│       ├── embeddings.ts                # Wrapper GeminiEmbeddings (768 dims)
+│       ├── queue.ts                     # Funciones de encolado, desencolado y reintentos
+│       ├── rag.ts                       # Orquestador LangChain, RAG y fallback de modelos
+│       ├── tools.ts                     # Tools Zod para consultas SQL a empleados/roles
+│       └── whatsapp.ts                  # Cliente HTTP para Meta Graph API
+├── vercel.json                          # Configuración de timeout y cron en Vercel
 ├── package.json
 └── tsconfig.json
 ```
 
 ---
 
-## 🔒 Control de Acceso y Privacidad
+## 📚 Índice de Documentación Técnica
 
-- **Búsqueda Vectorial Aislada:** El retriever solo tiene visibilidad sobre la tabla `documents`.
-- **Acceso Restringido por Tools:** La herramienta `consultar_empleados_y_roles` solo ejecuta consultas `SELECT` sobre `empleados` y `roles`.
-- **Protección de Datos Confidenciales:** La tabla `clientes` no posee conectores, APIs ni herramientas en la aplicación, garantizando que ninguna técnica de *prompt injection* pueda extraer sus registros.
+Para profundizar en el diseño del sistema, consulta los documentos de la carpeta [`docs/`](docs/):
+
+1. **[Flujo Completo del Chat](docs/flujo-completo-chat.md):** Traza detallada paso a paso del mensaje por el canal Web y el canal WhatsApp.
+2. **[Arquitectura de WhatsApp](docs/arquitectura-chatbot-whatsapp.md):** Configuración de Meta App, WABA, permisos y túnel HTTPS con ngrok.
+3. **[Diseño de Colas y Fiabilidad](docs/cola.md):** Principios de desacople, persistencia durable, idempotencia, backoff exponencial y DLQ.
+4. **[Arquitectura RAG y Tools](docs/arquitectura-rag-y-tools.md):** Diferenciación entre datos no estructurados y estructurados con Function Calling.
+5. **[Seguridad y Control de Acceso](docs/seguridad-control-acceso.md):** Estrategias para impedir accesos o filtración de la tabla confidencial `clientes`.
+6. **[Esquema de Tablas Supabase](docs/tablas-supabase.md):** Scripts SQL completos de `documents`, `roles`, `empleados`, `clientes` y `webhook_queue`.
+7. **[Guía de Despliegue en Vercel](docs/despliegue-vercel.md):** Opciones para ejecutar la cola en arquitecturas Serverless.
 
 ---
 
 ## 📄 Licencia
 
-Este proyecto es de código abierto bajo la licencia MIT.
+Este proyecto está licenciado bajo los términos de la licencia MIT.

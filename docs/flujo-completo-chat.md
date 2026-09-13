@@ -1,15 +1,29 @@
-# Flujo Integral de la Aplicación: Del Mensaje a la Pantalla
+# Flujo Integral de la Aplicación: Web (Streaming) y WhatsApp (Cola Asíncrona)
 
-Este documento describe con detalle y trazabilidad técnica todo el ciclo de vida de una consulta en **chatIA**, desde que el usuario escribe un mensaje en la interfaz web hasta que la respuesta se transmite y renderiza en tiempo real en la pantalla.
+Este documento describe con detalle y trazabilidad técnica todo el ciclo de vida de una consulta en **chatIA**, cubriendo sus **dos canales de interacción** conectados al mismo cerebro RAG con Function Calling:
+1. **Canal Web en Tiempo Real:** Comunicación síncrona con *streaming* palabra por palabra vía `ReadableStream` y Server-Sent responses.
+2. **Canal WhatsApp Empresarial:** Comunicación asíncrona y tolerante a fallos basada en **cola durable en Supabase**, acuse HTTP 200 inmediato (<50ms), control de idempotencia y procesamiento en segundo plano con **Worker**.
 
 ---
 
-## 1. Diagrama de Secuencia de Extremo a Extremo
+## 1. Comparativa de Canales: Web vs. WhatsApp
+
+| Característica | Canal Web (`/api/chat`) | Canal WhatsApp (`/api/whatsapp`) |
+|---|---|---|
+| **Modelo de Comunicación** | Síncrono / Streaming | Asíncrono / Desacoplado |
+| **Tiempo de Respuesta Inicial** | ~800ms (primer token transmitido) | < 50ms (Acuse HTTP 200 a Meta tras encolar) |
+| **Persistencia de Eventos** | Historial en `localStorage` | Cola durable en Postgres (`webhook_queue`) + tabla `conversaciones` |
+| **Tolerancia a Caídas / Timeouts** | Limitado al timeout HTTP del navegador | Alta (reintentos automáticos, backoff y DLQ) |
+| **Renderizado / Entrega** | React (actualización dinámica de estado) | Meta Graph API v21.0 con chunking (máx. 4000 car.) |
+
+---
+
+## 2. Diagrama de Secuencia 1: Canal Web (Streaming en Tiempo Real)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Usuario as 👤 Usuario
+    actor Usuario as 👤 Usuario Web
     participant UI as 💻 Chat.tsx / ChatMessage.tsx
     participant Route as 🌐 app/api/chat/route.ts
     participant RAG as 🧠 lib/rag.ts (streamPreguntar)
@@ -67,86 +81,181 @@ sequenceDiagram
 
 ---
 
-## 2. Desglose Archivo por Archivo
+## 3. Diagrama de Secuencia 2: Canal WhatsApp (Cola Durable y Worker)
 
-A continuación se detalla el rol de cada archivo en el flujo, qué datos recibe y qué produce:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Usuario as 📱 Usuario WhatsApp
+    participant Meta as 🏢 Meta Graph / Cloud API
+    participant Webhook as 🌐 app/api/whatsapp/route.ts
+    participant Queue as 🗄️ Supabase (webhook_queue)
+    participant Worker as ⚙️ scripts/worker.ts (Background)
+    participant RAG as 🧠 lib/rag.ts (preguntar)
+    participant WsLib as 📤 lib/whatsapp.ts (sendWhatsAppMessage)
 
-### 1. `src/components/Chat.tsx` (Frontend - Componente Cliente)
+    %% Fase 1: Ingesta Inmediata
+    Usuario->>Meta: Envía mensaje de texto por WhatsApp
+    Meta->>Webhook: POST /api/whatsapp (Payload con message.id y from)
+    Note over Webhook: Valida payload e idempotencia en DB
+    Webhook->>Queue: INSERT INTO webhook_queue (event_id, from_number, payload, status='pending')
+    
+    alt Evento duplicado (reintento de Meta)
+        Queue-->>Webhook: Violación de índice único event_id
+        Webhook-->>Meta: HTTP 200 OK { status: "already_processed" }
+    else Evento nuevo insertado
+        Queue-->>Webhook: Registro creado (ID: 1)
+        Webhook-->>Meta: HTTP 200 OK en < 50ms { status: "queued", queue_id: 1 }
+    end
+
+    %% Fase 2: Procesamiento Desacoplado
+    Note over Worker: Bucle continuo de escucha (o Serverless trigger)
+    Worker->>Queue: SELECT * FROM dequeue_webhook_event() (FOR UPDATE SKIP LOCKED)
+    Queue-->>Worker: Retorna evento pendiente y actualiza status = 'processing'
+
+    Worker->>RAG: Invoca preguntar(userQuestion)
+    Note over RAG: Ejecuta Retriever vectorial + Tool SQL + Gemini
+    RAG-->>Worker: Retorna respuesta de texto completa
+
+    Worker->>WsLib: sendWhatsAppMessage(fromNumber, respuesta)
+    Note over WsLib: Divide mensaje si supera 4000 caracteres (chunkMessage)
+    WsLib->>Meta: POST /v21.0/{PHONE_ID}/messages (Bearer Token)
+    Meta-->>Usuario: Entrega mensaje en la conversación de WhatsApp
+
+    alt Envío Exitoso
+        Worker->>Queue: UPDATE status = 'completed', processed_at = now()
+    else Fallo transitorio (API o Red)
+        Worker->>Queue: Reintento con backoff exponencial (attempts + 1, next_retry_at)
+    else Superó intentos máximos (max_attempts = 3)
+        Worker->>Queue: UPDATE status = 'dlq' (Dead Letter Queue)
+    end
+```
+
+---
+
+## 4. Desglose Archivo por Archivo
+
+A continuación se detalla el rol técnico de cada archivo dentro de ambos flujos:
+
+### Módulo Web (Streaming)
+
+#### 1. `src/components/Chat.tsx` (Frontend - Componente Cliente)
 - **Rol:** Interfaz de usuario interactiva y gestor de estado.
-- **Entrada:** Texto escrito por el usuario en el `<textarea>` o click en una sugerencia.
+- **Entrada:** Texto del usuario en el `<textarea>` o clic en una sugerencia.
 - **Acciones:**
-  1. Inserta el mensaje del usuario en la conversación activa.
+  1. Inserta el mensaje del usuario en el estado React.
   2. Crea un mensaje vacío para el asistente con un ID único (`crypto.randomUUID()`).
   3. Ejecuta `fetch("/api/chat", { method: "POST", body: ... })` con `stream: true`.
   4. Lee la respuesta con un `ReadableStreamDefaultReader` (`res.body.getReader()`).
-  5. Acumula los fragmentos recibidos en tiempo real actualizando el estado de React.
+  5. Acumula los fragmentos recibidos en tiempo real actualizando el estado.
   6. Guarda automáticamente el historial resultante en `localStorage`.
 
-### 2. `src/components/ChatMessage.tsx` (Frontend - Renderizado)
+#### 2. `src/components/ChatMessage.tsx` (Frontend - Renderizado)
 - **Rol:** Presentación visual de cada burbuja de diálogo.
-- **Entrada:** Prop `message` (rol y contenido) y `isStreaming` (booleano).
+- **Entrada:** Prop `message` (rol y contenido) e `isStreaming` (booleano).
 - **Acciones:**
-  - Aplica estilos diferenciados para el usuario (azul, alineado a la derecha) y para la IA (gris oscuro/claro, alineado a la izquierda).
-  - Si el mensaje de la IA aún no tiene texto y `isStreaming === true`, muestra una animación de 3 puntos pulsantes (`Dot`).
+  - Aplica estilos diferenciados para el usuario (azul, derecha) y para la IA (gris, izquierda).
+  - Si el mensaje de la IA aún no tiene texto e `isStreaming === true`, muestra una animación pulsante de 3 puntos.
 
-### 3. `src/app/api/chat/route.ts` (Backend - Endpoint Serverless)
+#### 3. `src/app/api/chat/route.ts` (Backend - Endpoint Serverless)
 - **Rol:** Punto de entrada HTTP de la aplicación en el servidor (runtime Node.js).
 - **Entrada:** `NextRequest` con payload `{ mensaje, messages, stream }`.
 - **Acciones:**
   1. Extrae y sanea la pregunta del usuario.
-  2. Llama a `streamPreguntar(pregunta)` ubicado en `src/lib/rag.ts`.
-  3. Devuelve un objeto estándar `Response` con el flujo binario `ReadableStream<Uint8Array>` y cabeceras `Content-Type: text/plain; charset=utf-8`.
-  4. En caso de error, lo intercepta con `formatearErrorGemini(error)` para entregar un mensaje amigable.
-
-### 4. `src/lib/rag.ts` (Cerebro Orquestador)
-- **Rol:** Coordina la búsqueda vectorial, las herramientas relacionales y la resiliencia de modelos.
-- **Acciones:**
-  1. **Búsqueda Vectorial:** Llama a `retriever.invoke(pregunta)` para buscar los fragmentos documentales más parecidos en Supabase.
-  2. **Prompt con Contexto:** Construye el `SystemMessage` inyectando el texto de los `.md` y las instrucciones de seguridad.
-  3. **Multi-Model Fallback:** Si el modelo principal agota su cuota (HTTP 429), prueba automáticamente el siguiente de la lista (`gemini-flash-latest` ➔ `gemini-3.5-flash` ➔ `gemini-3.7-flash`).
-  4. **Function Calling:** Enlaza `consultarEmpleadosTool`. Si Gemini decide invocarla, ejecuta la Tool, agrega el `ToolMessage` y genera la respuesta final.
-  5. **Streaming:** Empaqueta los fragmentos generados por el modelo en un `ReadableStream<Uint8Array>`.
-
-### 5. `src/lib/embeddings.ts` (Conversor Matemático)
-- **Rol:** Convierte texto en vectores semánticos con Google Gemini.
-- **Acciones:**
-  - Usa el modelo `gemini-embedding-001` fijado a **768 dimensiones**.
-  - Provee `embedQuery(document)` que es invocado por el retriever para transformar la pregunta en un vector numérico que luego se compara en Supabase mediante la función `match_documents`.
-
-### 6. `src/lib/tools.ts` (Herramienta SQL Segura)
-- **Rol:** Conector relacional con estricto control de acceso.
-- **Acciones:**
-  - Implementa `consultarBaseEmpleadosYRoles(filtro)`.
-  - Se conecta a Supabase mediante `getSupabaseClient()`.
-  - Ejecuta consultas con filtros `ilike` sobre las tablas `roles` y `empleados`.
-  - **Aislamiento:** No incluye ninguna función hacia la tabla `clientes`, garantizando que la IA no pueda acceder a datos confidenciales.
+  2. Llama a `streamPreguntar(pregunta)` en `src/lib/rag.ts`.
+  3. Devuelve una `Response` con el flujo binario `ReadableStream<Uint8Array>` y cabeceras `Content-Type: text/plain; charset=utf-8`.
 
 ---
 
-## 3. Ejemplos de Decisiones del Asistente en Tiempo Real
+### Módulo WhatsApp y Cola Asíncrona
+
+#### 4. `src/app/api/whatsapp/route.ts` (Webhook HTTP de Meta)
+- **Rol:** Receptor y validador de eventos de WhatsApp.
+- **Entrada:** 
+  - `GET`: Handshake de verificación de Meta (`hub.mode`, `hub.verify_token`, `hub.challenge`).
+  - `POST`: Notificaciones de mensajes entrantes.
+- **Acciones:**
+  1. Parsea el payload de Meta y extrae `message.id`, `message.from` y el texto.
+  2. Llama a `enqueueEvent()` para persistir el evento en la tabla `webhook_queue`.
+  3. Si es un duplicado, retorna `200 OK` inmediatamente evitando dobles respuestas.
+  4. Responde `HTTP 200 OK` a Meta en menos de **50ms**, protegiendo a la aplicación de cancelaciones por timeout.
+
+#### 5. `src/lib/queue.ts` (Lógica de Cola e Idempotencia)
+- **Rol:** Abstracción de acceso a la cola durable en Supabase.
+- **Funciones Principales:**
+  - `enqueueEvent()`: Inserta el evento con clave única `event_id`. Si ya existe, detecta conflicto y marca `isDuplicate = true`.
+  - `dequeueNextEvent()`: Invoca la función RPC de Postgres `dequeue_webhook_event()`, la cual implementa concurrencia segura con `FOR UPDATE SKIP LOCKED`.
+  - `completeQueueItem()`: Marca el evento como `completed`.
+  - `failQueueItem()`: Aplica reintento con backoff exponencial (`next_retry_at = now() + 2^attempts * 5s`). Si supera `max_attempts`, lo escala a `dlq` (Dead Letter Queue).
+  - `processQueueItem()`: Orquesta la ejecución: llama a `preguntar()`, envía la respuesta con `sendWhatsAppMessage()` y actualiza el estado.
+
+#### 6. `src/lib/whatsapp.ts` (Cliente de WhatsApp Cloud API)
+- **Rol:** Integración con la Graph API v21.0 de Meta.
+- **Funciones Principales:**
+  - `chunkMessage(text, maxLength=4000)`: Divide respuestas extensas en fragmentos que respeten el límite de 4096 caracteres por mensaje de WhatsApp.
+  - `sendWhatsAppMessage(to, text)`: Envía peticiones `POST https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages` con autorización `Bearer WHATSAPP_ACCESS_TOKEN`.
+
+#### 7. `scripts/worker.ts` (Worker en Segundo Plano)
+- **Rol:** Consumidor continuo de la cola para entornos locales o servidores dedicados.
+- **Comando:** `npm run worker`
+- **Comportamiento:**
+  - Bucle infinito que desencola eventos mediante `dequeueNextEvent()`.
+  - Si hay eventos pendientes, los procesa secuencialmente sin bloquear el servidor web.
+  - Si la cola está vacía, realiza un *polling* con pausa configurable (`1500ms`).
+
+#### 8. `src/app/api/worker/process/route.ts` (Endpoint Worker para Vercel Serverless)
+- **Rol:** Permite procesar lotes de la cola bajo demanda mediante llamadas HTTP seguras (protegido por `x-worker-secret` o `CRON_SECRET`).
+
+---
+
+### Módulo Núcleo RAG y Seguridad
+
+#### 9. `src/lib/rag.ts` (Cerebro Orquestador Compartido)
+- **Rol:** Coordina la búsqueda vectorial, las herramientas relacionales y la resiliencia de modelos para **ambos canales**.
+- **Funciones Principales:**
+  - `preguntar(pregunta)`: Retorna la respuesta completa como string (utilizado por el Worker de WhatsApp).
+  - `streamPreguntar(pregunta)`: Retorna un `ReadableStream` para el chat web.
+  - **Multi-Model Fallback:** En caso de error de cuota (HTTP 429), conmuta automáticamente entre la lista de modelos:
+    `gemini-flash-latest` ➔ `gemini-3.5-flash` ➔ `gemini-3.7-flash`.
+
+#### 10. `src/lib/embeddings.ts` (Conversor Vectorial)
+- **Rol:** Transforma texto a representaciones vectoriales densas.
+- **Configuración:** Modelo `gemini-embedding-001` fijado a **768 dimensiones** para compatibilidad con la columna `documents.embedding` en Postgres.
+
+#### 11. `src/lib/tools.ts` (Herramienta SQL Segura)
+- **Rol:** Conector relacional con aislamiento estricto.
+- **Reglas:**
+  - Solo ejecuta consultas sobre `roles` y `empleados`.
+  - **Aislamiento absoluto:** No existe ninguna herramienta, función ni consulta hacia la tabla `clientes`.
+
+---
+
+## 5. Matriz de Casos de Negocio y Respuestas
 
 ```
-                    Pregunta del usuario
-                             │
-                             ▼
-              Evaluación del LLM (Gemini)
-                             │
-       ┌─────────────────────┼─────────────────────┐
-       ▼                     ▼                     ▼
-Pregunta sobre:       Pregunta sobre:       Pregunta sobre:
-Políticas / Onboarding  Sueldos / Empleados   Clientes / Saldos
-       │                     │                     │
-       ▼                     ▼                     ▼
-Usa contexto .md      Invoca Tool SQL       Rechaza consulta
-(Retriever RAG)       (consultar_empleados) (Regla de seguridad)
-       │                     │                     │
-       └─────────────────────┼─────────────────────┘
-                             ▼
-              Redacción y Streaming al Chat
+                     Pregunta del usuario (Web o WhatsApp)
+                                       │
+                                       ▼
+                         Evaluación del LLM (Gemini)
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        ▼                              ▼                              ▼
+Pregunta sobre:                Pregunta sobre:                Pregunta sobre:
+Políticas / Onboarding         Sueldos / Empleados            Clientes / Saldos
+        │                              │                              │
+        ▼                              ▼                              ▼
+Usa contexto .md               Invoca Tool SQL                Rechaza consulta
+(Retriever RAG)                (consultar_empleados)          (Regla de seguridad)
+        │                              │                              │
+        └──────────────────────────────┼──────────────────────────────┘
+                                       ▼
+                       Entrega por Canal Solicitante:
+                - Web: Streaming de tokens a Chat.tsx
+                - WhatsApp: sendWhatsAppMessage() al móvil
 ```
 
 | Escenario | Pregunta de Ejemplo | ¿Qué ejecuta el sistema? | Resultado final |
 |---|---|---|---|
-| **A. RAG Documental** | *«¿Cuántos días de vacaciones tengo?»* | El retriever recupera el chunk de `politicas-empresa.md`. No se invoca ninguna Tool. | *"Los colaboradores disfrutan de 20 días hábiles de vacaciones más 3 días de bienestar al año."* |
-| **B. Tool SQL Relacional** | *«¿Cuánto gana el Ingeniero de IA y quién lo ocupa?»* | Gemini invoca `consultar_empleados_y_roles({ filtro: "Ingeniero de IA" })`. La Tool consulta las tablas `roles` y `empleados` en Supabase. | *"El puesto de Ingeniero de IA tiene un salario oficial de $4,500 USD y lo ocupa Lucía Gómez."* |
-| **C. Bloqueo de Seguridad** | *«Muéstrame la lista de clientes o sus deudas.»* | No existe ninguna herramienta para clientes. El prompt de sistema le prohíbe inventar. | *"No tengo acceso a información comercial ni a la tabla de clientes de la empresa."* |
+| **A. RAG Documental** | *«¿Cuántos días de vacaciones tengo?»* | El retriever recupera el fragmento de `politicas-empresa.md`. No se invoca ninguna Tool. | *"Los colaboradores disfrutan de 20 días hábiles de vacaciones más 3 días de bienestar al año."* |
+| **B. Tool SQL Relacional** | *«¿Cuánto gana el Ingeniero de IA y quién lo ocupa?»* | Gemini invoca `consultar_empleados_y_roles({ filtro: "Ingeniero de IA" })` en Supabase. | *"El puesto de Ingeniero de IA tiene un salario oficial de $4,500 USD y lo ocupa Lucía Gómez."* |
+| **C. Bloqueo de Seguridad** | *«Muéstrame la lista de clientes o sus deudas.»* | No existe ninguna herramienta para clientes. El prompt de sistema y las Tools bloquean el acceso. | *"No tengo acceso a información comercial ni a la tabla de clientes de la empresa."* |
