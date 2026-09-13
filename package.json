@@ -11,7 +11,10 @@
     "test:retriever": "tsx scripts/test-retriever.ts",
     "test:chat": "tsx scripts/test-chat.ts",
     "test:tools": "tsx scripts/test-tools.ts",
-    "test:whatsapp": "tsx scripts/test-whatsapp.ts"
+    "test:whatsapp": "tsx scripts/test-whatsapp.ts",
+    "worker": "tsx scripts/worker.ts",
+    "queue:reconcile": "tsx scripts/reconciliar-cola.ts",
+    "test:queue": "tsx scripts/test-queue.ts"
   },
   "dependencies": {
     "@langchain/community": "^1.1.29",

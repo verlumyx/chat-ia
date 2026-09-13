@@ -4,7 +4,7 @@ Este documento registra la arquitectura completa, el paso a paso detallado, las 
 
 ---
 
-## 1. Diagrama de Arquitectura de Extremo a Extremo
+## 1. Diagrama de Arquitectura Resiliente (Desacople, Cola Durable y Worker)
 
 ```mermaid
 sequenceDiagram
@@ -14,33 +14,37 @@ sequenceDiagram
     participant WABA as 🏢 WhatsApp Business Account (WABA)
     participant MetaApp as ⚙️ Meta App (Webhook Engine)
     participant Tunnel as 🚇 Túnel ngrok (HTTPS)
-    participant Route as 🌐 Next.js (/api/whatsapp)
+    participant Route as 🌐 Webhook (/api/whatsapp)
+    participant Queue as 🗄️ Supabase (webhook_queue)
+    participant Worker as ⚙️ Worker en Background (scripts/worker.ts)
     participant RAG as 🧠 lib/rag.ts (preguntar)
-    participant Supa as 🗄️ Supabase (VectorStore + DB)
+    participant Supa as 🗄️ Supabase (VectorStore & Historial)
     participant Graph as 📤 Meta Graph API (POST /messages)
 
-    %% Flujo entrante
+    %% Fase 1: Ingesta Inmediata y Acuse 200 (<50ms)
     Usuario->>MetaTel: Escribe: "¿Cuántos días de vacaciones tengo?"
     MetaTel->>WABA: Recibe el mensaje en la cuenta de negocio
-    Note over WABA,MetaApp: ⚠️ Requiere suscripción activa:<br/>POST /{WABA_ID}/subscribed_apps
     WABA->>MetaApp: Reenvía evento a la App vinculada
     MetaApp->>Tunnel: POST https://<ngrok>/api/whatsapp
     Tunnel->>Route: Entrega payload JSON
+    Route->>Queue: INSERT INTO webhook_queue (event_id UNIQUE)
+    alt Es duplicado (Reintento de Meta)
+        Route-->>MetaApp: Responde HTTP 200 { status: "already_processed" }
+    else Evento nuevo
+        Route-->>MetaApp: Responde HTTP 200 { status: "queued", queue_id: 123 }
+    end
 
-    %% Procesamiento en Next.js
-    Note over Route: 1. Valida estructura (payload real o simulador)<br/>2. Ignora estados (sent/read)<br/>3. Chequeo de idempotencia (Set de messageId)
-    Route->>Supa: Guarda mensaje del usuario (tabla conversaciones)
-    Route->>RAG: Invoca preguntar(pregunta)
-    RAG->>Supa: Búsqueda vectorial (match_documents) + Tool SQL si aplica
+    %% Fase 2: Procesamiento Desacoplado en Segundo Plano
+    Worker->>Queue: Dequeue (FOR UPDATE SKIP LOCKED)
+    Worker->>RAG: Invoca preguntar(pregunta)
+    RAG->>Supa: Búsqueda vectorial (match_documents) + Tool SQL
     Supa-->>RAG: Contexto documental (.md)
-    RAG-->>Route: Retorna texto limpio redactado por Gemini
-    Route->>Supa: Guarda respuesta del asistente
-
-    %% Flujo saliente
-    Route->>Graph: POST /v21.0/{PHONE_ID}/messages (Bearer Token)
+    RAG-->>Worker: Retorna texto limpio de Gemini
+    Worker->>Graph: POST /v21.0/{PHONE_ID}/messages
     Graph-->>MetaTel: Despacha mensaje
-    MetaTel-->>Usuario: Respuesta renderizada en el chat de WhatsApp
-    Route-->>MetaApp: Responde HTTP 200 { status: "success" }
+    MetaTel-->>Usuario: Respuesta renderizada en WhatsApp
+    Worker->>Supa: Guarda en tabla conversaciones
+    Worker->>Queue: UPDATE status = 'completed'
 ```
 
 ---

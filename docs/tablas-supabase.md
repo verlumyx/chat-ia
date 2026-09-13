@@ -318,4 +318,57 @@ on conflict (email) do nothing;
 insert into clientes (nombre, empresa, email, saldo_pendiente) values
   ('Banco Futuro S.A.', 'Banco Futuro', 'contacto@bancofuturo.com', 15000.00),
   ('Retail Global Corp', 'Retail Global', 'compras@retailglobal.com', 8500.00);
+
+-- ========================================================
+-- 6. COLA DURABLE DE WEBHOOKS (docs/cola.md)
+-- ========================================================
+create table if not exists webhook_queue (
+  id bigint primary key generated always as identity,
+  event_id text not null unique,
+  provider text not null default 'whatsapp',
+  from_number text not null,
+  payload jsonb not null,
+  status text not null default 'pending', -- pending, processing, completed, failed, dlq
+  attempts int not null default 0,
+  max_attempts int not null default 3,
+  last_error text,
+  next_retry_at timestamptz default now(),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  processed_at timestamptz
+);
+
+create index if not exists idx_webhook_queue_status_retry 
+on webhook_queue (status, next_retry_at) 
+where status in ('pending', 'failed');
+
+create unique index if not exists idx_webhook_queue_event_id 
+on webhook_queue (event_id);
+
+create or replace function dequeue_webhook_event()
+returns setof webhook_queue
+language plpgsql
+as $$
+declare
+  item_id bigint;
+begin
+  select id into item_id
+  from webhook_queue
+  where (status = 'pending' or (status = 'failed' and attempts < max_attempts))
+    and next_retry_at <= now()
+  order by created_at asc
+  limit 1
+  for update skip locked;
+
+  if item_id is not null then
+    update webhook_queue
+    set status = 'processing',
+        updated_at = now()
+    where id = item_id;
+
+    return query select * from webhook_queue where id = item_id;
+  end if;
+end;
+$$;
 ```
+

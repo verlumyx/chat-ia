@@ -1,11 +1,9 @@
 import { NextResponse } from "next/server";
-import { preguntar, getSupabaseClient } from "@/lib/rag";
-import { sendWhatsAppMessage } from "@/lib/whatsapp";
+// import { after } from "next/server"; // Descomentar si se desea procesamiento serverless en Vercel
+import { enqueueEvent } from "@/lib/queue";
+// import { dequeueNextEvent, processQueueItem } from "@/lib/queue"; // Descomentar para Vercel after()
 
 export const runtime = "nodejs";
-
-// Cache de IDs de mensajes para garantizar idempotencia y evitar respuestas duplicadas
-const processedMessageIds = new Set<string>();
 
 /**
  * Handshake de Verificación con Meta (GET)
@@ -33,7 +31,8 @@ export async function GET(req: Request) {
 }
 
 /**
- * Recepción y procesamiento de eventos entrantes de WhatsApp (POST)
+ * Recepción y persistencia en cola durable de eventos de WhatsApp (POST)
+ * Principio de docs/cola.md: "Persistir primero, confirmar (200) después. Procesar aparte."
  */
 export async function POST(req: Request) {
   try {
@@ -60,65 +59,69 @@ export async function POST(req: Request) {
     const messageId = message.id;
     const fromNumber = message.from; // Número de teléfono del usuario
 
-    // Control de Idempotencia: si Meta reintenta el mismo mensaje, ignoramos
-    if (processedMessageIds.has(messageId)) {
-      console.log(`ℹ️ [Webhook WhatsApp] Mensaje ya procesado previamente (${messageId}), ignorando.`);
-      return NextResponse.json({ status: "already_processed" }, { status: 200 });
+    // 1. Guardar en almacén durable (Idempotencia + Desacople)
+    const enqueueResult = await enqueueEvent({
+      eventId: messageId,
+      fromNumber,
+      payload: message,
+      provider: "whatsapp",
+    });
+
+    // Si ya existía (Idempotencia a nivel de base de datos)
+    if (enqueueResult.isDuplicate) {
+      console.log(`ℹ️ [Webhook WhatsApp] Mensaje duplicado detectado en DB (${messageId}), ignorando.`);
+      return NextResponse.json({ status: "already_processed", event_id: messageId }, { status: 200 });
     }
 
-    // Registrar ID procesado (con límite máximo de memoria de 500 registros)
-    processedMessageIds.add(messageId);
-    if (processedMessageIds.size > 500) {
-      const oldestId = processedMessageIds.values().next().value;
-      if (oldestId) processedMessageIds.delete(oldestId);
-    }
-
-    // Manejar mensajes que no sean texto (audio, imagen, documento, ubicación, etc.)
-    if (message.type !== "text") {
-      console.log(`ℹ️ [Webhook WhatsApp] Mensaje recibido de tipo '${message.type}' desde ${fromNumber}.`);
-      await sendWhatsAppMessage(
-        fromNumber,
-        "Por los momentos solo puedo responder a preguntas en texto escrito. ¿En qué te puedo ayudar hoy?"
+    // Si falló la persistencia en DB, devolver 500 para que Meta reintente con backoff
+    if (!enqueueResult.success) {
+      console.error(`❌ [Webhook WhatsApp] Falló la persistencia del evento ${messageId} en cola.`);
+      return NextResponse.json(
+        { status: "error", message: "Error persistiendo en cola durable" },
+        { status: 500 }
       );
-      return NextResponse.json({ status: "non_text_message_handled" }, { status: 200 });
     }
 
-    const userQuestion = message.text?.body?.trim();
-    if (!userQuestion) {
-      return NextResponse.json({ status: "empty_text" }, { status: 200 });
-    }
-
-    console.log(`📩 [WhatsApp] Mensaje de ${fromNumber}: "${userQuestion}"`);
-
-    // 1. Invocar el cerebro RAG existente (LangChain + Gemini + Tools)
-    const assistantReply = await preguntar(userQuestion);
-    console.log(`🤖 [WhatsApp] Respuesta para ${fromNumber}: "${assistantReply.slice(0, 100)}..."`);
-
-    // 2. Enviar respuesta por WhatsApp a través de la Graph API
-    const sendResult = await sendWhatsAppMessage(fromNumber, assistantReply);
-
-    if (!sendResult.success) {
-      console.error(`❌ [WhatsApp] Error despachando respuesta a ${fromNumber}:`, sendResult.error);
-    }
-
-    // 3. Persistir en la tabla 'conversaciones' de Supabase (opcional / tolerante a fallos)
+    // -------------------------------------------------------------------------
+    // NOTA: Procesamiento automático de Vercel (after) comentado temporalmente.
+    // El webhook únicamente encola y confirma 200 OK inmediatamente a Meta.
+    // El procesamiento se realiza de forma manual y controlada en local con:
+    //   npm run worker
+    // Para reactivar en Vercel Serverless, descomenta el bloque siguiente:
+    // -------------------------------------------------------------------------
+    /*
     try {
-      const supabase = getSupabaseClient();
-      await supabase.from("conversaciones").insert([
-        { user_id: fromNumber, role: "user", content: userQuestion },
-        { user_id: fromNumber, role: "assistant", content: assistantReply },
-      ]);
-    } catch (dbError) {
-      console.warn("⚠️ [WhatsApp] No se pudo registrar en la tabla 'conversaciones':", dbError);
+      after(async () => {
+        try {
+          const item = await dequeueNextEvent();
+          if (item) {
+            console.log(`⚡ [Vercel after()] Procesando evento ${item.event_id} en background...`);
+            await processQueueItem(item);
+          }
+        } catch (bgErr) {
+          console.error("❌ [Vercel after()] Error en procesamiento desacoplado:", bgErr);
+        }
+      });
+    } catch {
+      console.log("ℹ️ [Webhook WhatsApp] after() omitido.");
     }
+    */
 
-    return NextResponse.json({ status: "success" }, { status: 200 });
+    // 2. Responder 200 inmediatamente a Meta en <50ms
+    return NextResponse.json(
+      {
+        status: "queued",
+        event_id: messageId,
+        queue_id: enqueueResult.item?.id,
+      },
+      { status: 200 }
+    );
   } catch (error: unknown) {
-    console.error("❌ [Webhook WhatsApp] Error interno procesando evento:", error);
-    // Responder siempre 200 a Meta para evitar bucles continuos de reintento si el error fue de parseo
+    console.error("❌ [Webhook WhatsApp] Error interno procesando webhook:", error);
     return NextResponse.json(
       { status: "error", message: error instanceof Error ? error.message : "Error interno" },
-      { status: 200 }
+      { status: 400 }
     );
   }
 }
+
