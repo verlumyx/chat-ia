@@ -184,6 +184,22 @@ ${documentContext || "No hay documentos relevantes disponibles."}
 `);
 }
 
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in part) {
+          return String((part as { text: string }).text);
+        }
+        return JSON.stringify(part);
+      })
+      .join("");
+  }
+  return String(content || "");
+}
+
 /**
  * Función central de RAG + Tools con conmutación por error (Fallback) entre modelos
  */
@@ -224,14 +240,10 @@ export async function preguntar(question: string): Promise<string> {
         }
 
         const finalResponse = await modelWithTools.invoke(messages);
-        return typeof finalResponse.content === "string"
-          ? finalResponse.content
-          : JSON.stringify(finalResponse.content);
+        return extractText(finalResponse.content);
       }
 
-      return typeof firstResponse.content === "string"
-        ? firstResponse.content
-        : JSON.stringify(firstResponse.content);
+      return extractText(firstResponse.content);
     } catch (err: unknown) {
       console.warn(`⚠️ Modelo ${modelName} no disponible. Intentando con siguiente modelo de respaldo...`);
       lastError = err;
