@@ -39,12 +39,11 @@ export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    // Validar estructura básica del webhook de WhatsApp Cloud API
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
+    // Soportar tanto webhooks de producción como el simulador de pruebas de Meta
+    const value = body.value || body.entry?.[0]?.changes?.[0]?.value;
 
     if (!value) {
+      console.log("ℹ️ [Webhook WhatsApp] Payload sin 'value' detectable:", JSON.stringify(body));
       return NextResponse.json({ status: "ignored_empty_payload" }, { status: 200 });
     }
 

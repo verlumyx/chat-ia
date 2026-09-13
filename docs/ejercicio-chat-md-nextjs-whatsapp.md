@@ -328,15 +328,15 @@ tus `.md`.
 
 ## Checklist final
 
-- [ ] Fase 0 — Next.js corriendo + Supabase con tabla `documents` + `.env.local`
-- [ ] Fase 1 — Script de ingesta sube los trozos de los `.md` a Supabase
-- [ ] Fase 2 — El retriever consulta la base vectorial (sin re-indexar)
-- [ ] Fase 3 — La chain RAG responde desde un script
-- [ ] Fase 4 — `/api/chat` responde por HTTP (runtime Node)
-- [ ] Fase 5 — Chat web funcional
-- [ ] Fase 6 — WhatsApp conectado al mismo cerebro
-- [ ] Despliegue — app en Vercel + ingesta re-ejecutable
-- [ ] Mejoras — historial en Supabase, idempotencia, streaming
+- [x] Fase 0 — Next.js corriendo + Supabase con tabla `documents` + `.env.local`
+- [x] Fase 1 — Script de ingesta sube los trozos de los `.md` a Supabase
+- [x] Fase 2 — El retriever consulta la base vectorial (sin re-indexar)
+- [x] Fase 3 — La chain RAG responde desde un script
+- [x] Fase 4 — `/api/chat` responde por HTTP (runtime Node)
+- [x] Fase 5 — Chat web funcional
+- [x] Fase 6 — WhatsApp conectado al mismo cerebro
+- [x] Despliegue — app en Vercel + ingesta re-ejecutable
+- [x] Mejoras — historial en Supabase, idempotencia, streaming
 
 ## Relacionado
 

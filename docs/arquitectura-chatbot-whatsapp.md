@@ -1,214 +1,258 @@
-# Arquitectura y Configuración del Canal WhatsApp (Meta Cloud API)
+# Canal WhatsApp con Meta Cloud API (Fase 6): Guía Completa de Implementación y Solución de Problemas
 
-Este documento detalla la guía paso a paso para configurar **Meta for Developers**, obtener las credenciales de la **WhatsApp Cloud API**, y la arquitectura técnica del webhook que conecta WhatsApp con el cerebro RAG de **chatIA**.
+Este documento registra la arquitectura completa, el paso a paso detallado, las decisiones de código y la resolución de incidentes técnicos para conectar **WhatsApp (Meta Cloud API)** al cerebro RAG (**Next.js + LangChain + Gemini + Supabase**) de **chatIA**.
 
 ---
 
-## 1. Flujo de Integración de Extremo a Extremo
+## 1. Diagrama de Arquitectura de Extremo a Extremo
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Usuario as 📱 Usuario (WhatsApp)
-    participant Meta as ☁️ Meta Cloud API (WhatsApp)
-    participant Ngrok as 🚇 Túnel HTTPS (ngrok / Vercel)
-    participant Webhook as 🌐 /api/whatsapp (Route Handler)
+    actor Usuario as 📱 Usuario (WhatsApp Móvil)
+    participant MetaTel as 📞 Número de Prueba (+1 555...)
+    participant WABA as 🏢 WhatsApp Business Account (WABA)
+    participant MetaApp as ⚙️ Meta App (Webhook Engine)
+    participant Tunnel as 🚇 Túnel ngrok (HTTPS)
+    participant Route as 🌐 Next.js (/api/whatsapp)
     participant RAG as 🧠 lib/rag.ts (preguntar)
-    participant Supabase as 🗄️ Supabase (conversaciones)
-    participant GraphAPI as 📤 Graph API (POST /messages)
+    participant Supa as 🗄️ Supabase (VectorStore + DB)
+    participant Graph as 📤 Meta Graph API (POST /messages)
 
-    Usuario->>Meta: Envía mensaje de texto por WhatsApp
-    Meta->>Ngrok: POST webhook con payload del mensaje
-    Ngrok->>Webhook: Entrega payload JSON
-    Note over Webhook: 1. Valida estructura del payload<br/>2. Ignora eventos de estado (sent, delivered, read)<br/>3. Extrae texto, teléfono del usuario y messageId
-    Webhook->>Supabase: Registra mensaje entrante del usuario (rol: 'user')
-    Webhook->>RAG: Invoca cerebro RAG: preguntar(texto)
-    Note over RAG: Busca en Supabase VectorStore + ejecuta Tools SQL si aplica + Gemini LLM
-    RAG-->>Webhook: Retorna respuesta generada
-    Webhook->>Supabase: Registra respuesta del asistente (rol: 'assistant')
-    Webhook->>GraphAPI: POST https://graph.facebook.com/v21.0/{PHONE_ID}/messages
-    GraphAPI-->>Meta: Despacha mensaje
-    Meta-->>Usuario: Muestra la respuesta en WhatsApp
-    Webhook-->>Meta: Responde HTTP 200 { status: "ok" }
+    %% Flujo entrante
+    Usuario->>MetaTel: Escribe: "¿Cuántos días de vacaciones tengo?"
+    MetaTel->>WABA: Recibe el mensaje en la cuenta de negocio
+    Note over WABA,MetaApp: ⚠️ Requiere suscripción activa:<br/>POST /{WABA_ID}/subscribed_apps
+    WABA->>MetaApp: Reenvía evento a la App vinculada
+    MetaApp->>Tunnel: POST https://<ngrok>/api/whatsapp
+    Tunnel->>Route: Entrega payload JSON
+
+    %% Procesamiento en Next.js
+    Note over Route: 1. Valida estructura (payload real o simulador)<br/>2. Ignora estados (sent/read)<br/>3. Chequeo de idempotencia (Set de messageId)
+    Route->>Supa: Guarda mensaje del usuario (tabla conversaciones)
+    Route->>RAG: Invoca preguntar(pregunta)
+    RAG->>Supa: Búsqueda vectorial (match_documents) + Tool SQL si aplica
+    Supa-->>RAG: Contexto documental (.md)
+    RAG-->>Route: Retorna texto limpio redactado por Gemini
+    Route->>Supa: Guarda respuesta del asistente
+
+    %% Flujo saliente
+    Route->>Graph: POST /v21.0/{PHONE_ID}/messages (Bearer Token)
+    Graph-->>MetaTel: Despacha mensaje
+    MetaTel-->>Usuario: Respuesta renderizada en el chat de WhatsApp
+    Route-->>MetaApp: Responde HTTP 200 { status: "success" }
 ```
 
 ---
 
-## 2. Paso a Paso: Configuración en Meta for Developers
+## 2. Paso a Paso: Configuración Inicial en Meta for Developers
 
-### Paso 2.1: Crear la App en Meta
-1. Ingresa a la consola de desarrolladores en [developers.facebook.com/apps](https://developers.facebook.com/apps/) e inicia sesión con tu cuenta de Facebook/Meta.
-2. Haz clic en el botón **"Crear app"** (*Create App*).
-3. En la selección de caso de uso o tipo de app:
-   * Selecciona **"Otro"** (*Other*) y pulsa **Siguiente**.
-   * Selecciona el tipo de app **"Negocios"** (*Business*) y pulsa **Siguiente**.
-4. Completa el formulario básico:
-   * **Nombre de la app:** Asigna un nombre identificativo (ej. `chatia-bot` o `novatech-assistant`).
-   * **Correo de contacto:** Tu correo electrónico habitual.
-   * **Cartera comercial / Business Account:** Selecciona tu cuenta de negocio si dispones de una, o permite que Meta cree una por defecto.
-5. Haz clic en **"Crear app"** y completa la comprobación de seguridad si te lo solicita.
+### 2.1 Crear la App y el Portfolio Comercial
+1. Acceder a [developers.facebook.com/apps](https://developers.facebook.com/apps/).
+2. Crear una nueva aplicación:
+   * Tipo de caso de uso: **"Otro"** (*Other*).
+   * Tipo de aplicación: **"Negocios"** (*Business*).
+   * Asignar nombre: `CHATBOT IA TEST` (o similar).
+3. **Creación del Portfolio Comercial (Business Portfolio):**
+   * Meta exige que las apps de WhatsApp pertenezcan a un portfolio comercial.
+   * Si aparece el modal *"Crea un portfolio comercial"*, pulsar **Continuar**, colocar un nombre (ej. `ChatIA Dev`), tu nombre y correo. Es 100% gratuito y no requiere empresa legal para desarrollo.
 
----
+### 2.2 Activar el Producto WhatsApp
+1. En el panel lateral de la aplicación, buscar **"WhatsApp"** y hacer clic en **"Configurar"** (*Set up*).
+2. En el menú desplegable de WhatsApp, ingresar a **"Paso 1. Pruébalo"** (*API Setup* o *Getting Started*).
 
-### Paso 2.2: Agregar el Producto WhatsApp
-1. En el panel principal de la aplicación (*App Dashboard*), busca la sección **"Agregar productos a tu app"** (*Add products to your app*).
-2. Localiza la tarjeta de **WhatsApp** y presiona **"Configurar"** (*Set up*).
-3. Acepta los términos de servicio de la API de WhatsApp Business.
+### 2.3 Obtener las 4 Credenciales Clave
+En la pantalla **"Paso 1. Pruébalo"** se encuentran los identificadores necesarios:
 
----
-
-### Paso 2.3: Obtener las Credenciales de la API
-
-En el menú lateral izquierdo de tu app en Meta, navega a:
-**WhatsApp** ➔ **Configuración de la API** (*API Setup* o *Introducción*).
-
-En esa pantalla encontrarás las tres credenciales fundamentales:
-
-| Credencial | Dónde ubicarlo en Meta | Variable en `.env` | Descripción |
+| Credencial | Ubicación en Meta | Variable de Entorno | Ejemplo / Formato |
 |---|---|---|---|
-| **Access Token Temporal** | Campo *"Token de acceso temporal"* con botón *Copiar* | `WHATSAPP_ACCESS_TOKEN` | Token Bearer para autenticar llamadas de salida hacia la Graph API. En pruebas dura 24 horas. |
-| **Phone Number ID** | Casilla *"Identificador de número de teléfono"* | `WHATSAPP_PHONE_NUMBER_ID` | Identificador numérico del número telefónico emisor de pruebas asignado por Meta. *(Nota: no confundir con el WABA ID ni con el número de teléfono con signo +)*. |
-| **Verify Token** | **Lo inventas tú** libremente | `WHATSAPP_VERIFY_TOKEN` | Cadena secreta arbitraria para el handshake de verificación entre Meta y tu servidor. |
+| **Access Token Temporal** | Botón azul *"Generar token"* en la sección Token de acceso | `WHATSAPP_ACCESS_TOKEN` | `EAAX...` (Cadena alfanumérica larga, válida por 24h) |
+| **Phone Number ID** | Casilla *"Phone Number ID"* junto al número de prueba | `WHATSAPP_PHONE_NUMBER_ID` | `1258887770648904` |
+| **WhatsApp Business Account ID** | Casilla *"WhatsApp Business account ID"* | Usado para suscripción WABA | `3148800701982517` |
+| **Verify Token** | **Lo defines tú** libremente en tu código | `WHATSAPP_VERIFY_TOKEN` | `chatia_token_secreto_2026` |
 
 > [!WARNING]
-> En la sección de configuración de Meta aparecen dos identificadores parecidos:
-> 1. **Identificador del número de teléfono** (Phone Number ID) ➔ **ESTE es el que debes usar**.
-> 2. **Identificador de la cuenta de WhatsApp Business** (WABA ID) ➔ No se usa para el envío de mensajes ordinarios.
+> Meta muestra dos números largos juntos:
+> 1. **Phone Number ID:** Se utiliza en la URL para **enviar mensajes** (`POST /v21.0/{PHONE_ID}/messages`).
+> 2. **WhatsApp Business Account ID (WABA ID):** Identifica a la cuenta empresarial dueña del número. Se utiliza para **vincular aplicaciones suscritas** (`subscribed_apps`).
+
+### 2.4 Autorizar y Abrir la Ventana de Conversación de Prueba
+Por motivos de privacidad, los números de prueba (`+1 555...`) solo pueden comunicarse con números autorizados:
+1. En **"Paso 1. Pruébalo"**, sección **"Destinatario"**, seleccionar **"Administrar lista de números de teléfono"**.
+2. Agregar tu número de WhatsApp personal (con código de país) y confirmar el código SMS/WhatsApp de 6 dígitos.
+3. **Paso crítico (Iniciar conversación):** Seleccionar tu número en el desplegable y presionar el botón azul **"Enviar mensaje"**.
+   * Esto envía la plantilla *"Hello World"* o *"Confirmación de pedido"* a tu celular y **abre la ventana de servicio de 24 horas**. Sin este envío inicial de plantilla, Meta no permite que recibas ni envíes mensajes libres.
 
 ---
 
-### Paso 2.4: Autorizar tu Teléfono para Pruebas (Lista de Destinatarios)
+## 3. Configuración del Entorno y Next.js
 
-En el entorno de desarrollo y pruebas de Meta, la app se encuentra en modo *Development*. Por políticas de privacidad, solo puede intercambiar mensajes con números autorizados:
-
-1. En la misma pantalla de **Configuración de la API**, localiza la sección **"Paso 1: Seleccionar números de teléfono"** o el selector desplegable **"Para" (*To*)**.
-2. Despliega la lista y selecciona **"Administrar lista de números de teléfono"** (*Manage phone number list*).
-3. Añade tu número de teléfono móvil personal con el código de país (ejemplo: `+58...`, `+54...`, `+34...`, etc.).
-4. Meta te enviará un código de verificación de 6 dígitos por WhatsApp. Introdúcelo en la pantalla para validar la posesión del número.
-5. **Prueba de envío inicial:** Haz clic en el botón azul **"Enviar mensaje"** (*Send test message*). Deberías recibir un mensaje con la plantilla de bienvenida `"Hello World"` en tu WhatsApp.
-
----
-
-## 3. Variables de Entorno del Proyecto
-
-Crea o actualiza las siguientes variables en tu archivo `.env` o `.env.local` en la raíz del proyecto:
+### 3.1 Variables de Entorno (`.env`)
+En la raíz del proyecto se configuran los valores obtenidos:
 
 ```env
-# ========================================================
-# CREDENCIALES EXISTENTES
-# ========================================================
+# Google Gemini y Supabase (Fases 1 a 5)
 GOOGLE_API_KEY="AIzaSy..."
 SUPABASE_URL="https://xxxxxxxx.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY="eyJhbGci..."
 
-# ========================================================
-# FASE 6: CANAL WHATSAPP (Meta Cloud API)
-# ========================================================
-# Token secreto que inventas tú para validar la URL del webhook en Meta
-WHATSAPP_VERIFY_TOKEN="chatia_webhook_secret_token_2026"
-
-# Token de acceso (temporal de 24h o token permanente de usuario de sistema)
+# WhatsApp Cloud API (Fase 6)
+WHATSAPP_PHONE_NUMBER_ID="1258887770648904"
 WHATSAPP_ACCESS_TOKEN="EAAXxxxxxx..."
+WHATSAPP_VERIFY_TOKEN="chatia_token_secreto_2026"
+```
 
-# Identificador único del número de teléfono en Meta Developers
-WHATSAPP_PHONE_NUMBER_ID="109283746501928"
+### 3.2 Soporte de Dominios de Túnel en `next.config.ts`
+Para evitar que Next.js en desarrollo bloquee peticiones entrantes desde dominios de ngrok o dev tunnels:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  allowedDevOrigins: ["*.ngrok-free.app", "*.ngrok-free.dev", "*.ngrok.app"],
+};
+
+export default nextConfig;
 ```
 
 ---
 
-## 4. Arquitectura del Endpoint Webhook (`src/app/api/whatsapp/route.ts`)
+## 4. Implementación del Código
 
-El webhook debe cumplir dos responsabilidades según las especificaciones de Meta:
+### 4.1 Cliente Emisor de WhatsApp (`src/lib/whatsapp.ts`)
+Encargado de formatear y despachar mensajes hacia la Graph API de Meta:
+* **Límite de caracteres:** WhatsApp admite hasta 4096 caracteres por mensaje. Se implementó `chunkMessage()` para segmentar respuestas extensas en párrafos sin cortar oraciones.
+* **Llamada a Meta Graph API:**
+  `POST https://graph.facebook.com/v21.0/${phoneNumberId}/messages`
+  con encabezado `Authorization: Bearer ${token}` y payload:
+  ```json
+  {
+    "messaging_product": "whatsapp",
+    "recipient_type": "individual",
+    "to": "58412XXXXXXX",
+    "type": "text",
+    "text": { "preview_url": false, "body": "Texto de respuesta..." }
+  }
+  ```
 
-### 4.1 Handshake de Verificación (`GET`)
-Cuando registras la URL de tu webhook en Meta Developers, Meta realiza una petición `GET` automática con tres parámetros en la query:
+### 4.2 Endpoint Webhook (`src/app/api/whatsapp/route.ts`)
+Implementa las dos operaciones requeridas por Meta con runtime Node.js (`export const runtime = "nodejs"`):
+
+#### 1. Verificación del Webhook (`GET`)
+Meta realiza un handshake HTTP inicial con tres parámetros de consulta:
 * `hub.mode`: Debe ser `"subscribe"`.
-* `hub.verify_token`: Debe coincidir exactamente con tu `WHATSAPP_VERIFY_TOKEN`.
-* `hub.challenge`: Un número aleatorio generado por Meta.
+* `hub.verify_token`: Debe coincidir exactamente con `WHATSAPP_VERIFY_TOKEN`.
+* `hub.challenge`: Código aleatorio que el endpoint debe devolver como texto plano con HTTP 200.
 
-Si el token coincide, el endpoint debe devolver **únicamente el contenido de `hub.challenge`** como texto plano con código HTTP `200`.
-
-### 4.2 Recepción y Despacho de Mensajes (`POST`)
-Cuando un usuario escribe al número de WhatsApp, Meta dispara un `POST` con un cuerpo JSON anidado:
-
-```json
-{
-  "object": "whatsapp_business_account",
-  "entry": [
-    {
-      "changes": [
-        {
-          "value": {
-            "messaging_product": "whatsapp",
-            "messages": [
-              {
-                "from": "584121234567",
-                "id": "wamid.HBgL...",
-                "timestamp": "1710334800",
-                "text": { "body": "¿Cuántos días de vacaciones tengo?" },
-                "type": "text"
-              }
-            ]
-          }
-        }
-      ]
-    }
-  ]
-}
-```
-
-#### Reglas de procesamiento en el `POST`:
-1. **Filtrar eventos:** Meta también envía notificaciones de estado de lectura (`statuses: [{ status: "delivered" }, { status: "read" }]`). El endpoint debe validar que `messages` exista y sea un mensaje de tipo `text`. Si es solo un cambio de estado, responde `200 OK` inmediatamente sin llamar al LLM.
-2. **Idempotencia:** WhatsApp reintenta la entrega si tu servidor tarda más de unos segundos en responder. Se debe llevar control del `message.id` (`wamid`) para no responder dos veces a la misma consulta.
-3. **Invocación al RAG:** Se envía `message.text.body` a `preguntar(texto)` de `src/lib/rag.ts`.
-4. **Envío de Respuesta:** Se invoca la Graph API mediante `POST https://graph.facebook.com/v21.0/${WHATSAPP_PHONE_NUMBER_ID}/messages` con el token Bearer.
+#### 2. Recepción de Mensajes (`POST`)
+* **Soporte dual de estructura:** Soporta tanto el payload de producción (`entry[0].changes[0].value`) como el payload del simulador web de Meta (`body.value`).
+* **Filtro de estados:** Descarta silenciosamente notificaciones de entrega o lectura (`statuses: [{ status: "delivered" }]`) respondiendo `200 OK` para no saturar el servidor ni llamar a la IA innecesariamente.
+* **Control de Idempotencia:** Mantiene en memoria una lista de IDs procesados (`processedMessageIds = new Set<string>()`). Si Meta reintenta la misma entrega por lentitud de red, se detecta el `message.id` (`wamid`) y se ignora el duplicado.
+* **Cerebro RAG e Historial:** Extrae el texto, llama a `preguntar(userQuestion)` de `src/lib/rag.ts`, guarda la conversación en Supabase (`tabla conversaciones`) y envía la respuesta al usuario mediante `sendWhatsAppMessage()`.
 
 ---
 
-## 5. Exposición Pública para Pruebas Locales (Túnel HTTPS)
+## 5. Exposición Pública Local (Túnel ngrok)
 
-Meta exige obligatoriamente que la URL del webhook sea pública y tenga certificado SSL válido (`https://`). Durante el desarrollo local en tu máquina:
+Meta exige una URL pública con HTTPS obligatorio para los webhooks:
 
-1. Inicia tu servidor local:
+1. **Configurar el authtoken de ngrok:**
    ```bash
-   npm run dev
+   npx ngrok config add-authtoken <TU_AUTHTOKEN_DE_NGROK>
    ```
-2. En otra terminal, abre un túnel con **ngrok**:
+2. **Levantar el túnel al puerto de Next.js (3000):**
    ```bash
    npx ngrok http 3000
    ```
-3. Obtendrás una URL similar a:
-   `https://a1b2-c3d4.ngrok-free.app`
-4. Tu URL definitiva del webhook para Meta será:
-   `https://a1b2-c3d4.ngrok-free.app/api/whatsapp`
+3. ngrok genera una URL HTTPS pública (ej. `https://entwine-strobe-cultivate.ngrok-free.dev`).
+4. La URL final del webhook es:
+   `https://entwine-strobe-cultivate.ngrok-free.dev/api/whatsapp`
 
 ---
 
-## 6. Registro del Webhook en Meta Developers
+## 6. Configuración del Webhook en Meta Developers
 
-Una vez levantado tu túnel y con el endpoint implementado:
-
-1. En la consola de Meta, ve al menú lateral: **WhatsApp** ➔ **Configuración** (*Configuration*).
-2. Localiza el bloque **"Webhook"** y haz clic en **"Editar"** (*Edit*).
-3. Introduce:
-   * **URL de devolución de llamada (*Callback URL*):** `https://<tu-url-ngrok>/api/whatsapp`
-   * **Identificador de verificación (*Verify Token*):** El valor exacto que asignaste a `WHATSAPP_VERIFY_TOKEN`.
-4. Haz clic en **"Verificar y guardar"** (*Verify and Save*). Meta enviará el `GET` de prueba en milisegundos.
-5. Una vez guardado, en la tabla de **Campos del webhook** (*Webhook fields*), haz clic en **"Administrar"** (*Manage*) y suscríbete al evento:
-   * ✅ **`messages`**
-6. ¡Listo! Todo mensaje enviado a tu número de prueba disparará el flujo hacia tu Next.js local.
+1. En el panel de Meta, en el menú lateral izquierdo ir a **Webhooks** (o dentro de **WhatsApp** ➔ **Configuración**).
+2. En la lista desplegable de producto, seleccionar **`Whatsapp Business Account`**.
+3. Presionar **"Editar"** o configurar:
+   * **URL de devolución de llamada:** `https://<tu-subdominio-ngrok>/api/whatsapp`
+   * **Token de verificación:** El valor de `WHATSAPP_VERIFY_TOKEN` (`chatia_token_secreto_2026`).
+4. Hacer clic en **"Verificar y guardar"**.
+   * En la terminal local se observará: `✅ [Webhook WhatsApp] Verificación exitosa de Meta. (HTTP 200)`.
+5. En la tabla de **Campos del webhook**, buscar **`messages`** y marcar el interruptor como **"Suscrito"**.
 
 ---
 
-## 7. Paso a Producción: Token Permanente de Sistema
+## 7. El Incidente Clave y su Solución: Vinculación WABA (`subscribed_apps`)
 
-El token de la pantalla inicial caduca en 24 horas. Para producción o despliegues estables en Vercel:
+### El Problema Detectado:
+Al probar el botón del simulador web de Meta (*"Enviar al servidor"*), la petición llegaba a Next.js y la IA respondía. **Sin embargo**, al escribir directamente desde la aplicación de WhatsApp en el celular, la terminal no recibía ninguna petición `POST`.
 
-1. Ve a [business.facebook.com/settings](https://business.facebook.com/settings).
-2. En el menú lateral: **Usuarios** ➔ **Usuarios del sistema** (*System Users*).
-3. Haz clic en **Agregar** y crea un usuario del sistema (Rol: *Administrador*).
-4. En **Activos asignados**, asígnale tu App de WhatsApp con permisos de control total.
-5. Haz clic en **"Generar nuevo token"**, selecciona tu App y marca los permisos:
-   * `whatsapp_business_messaging`
-   * `whatsapp_business_management`
-6. Guarda este token permanente como `WHATSAPP_ACCESS_TOKEN` en las variables de entorno de Vercel.
+### Causa Raíz:
+En la arquitectura de Meta, existen dos niveles:
+1. **La App:** Sabe a qué URL de webhook despachar datos.
+2. **La Cuenta de WhatsApp Business (WABA):** Es la entidad propietaria del número de teléfono.
+
+Por defecto, crear una app y suscribir el campo `messages` **no suscribe automáticamente la cuenta de WhatsApp (WABA) a esa App**. Por lo tanto, cuando un usuario escribe al número de teléfono, la WABA no tiene la instrucción de despacharle los eventos a la App del desarrollador.
+
+### Solución Definitiva (Comando de Vinculación):
+Se debe ejecutar una petición HTTP hacia el endpoint `subscribed_apps` de la WABA:
+
+```bash
+curl -X POST "https://graph.facebook.com/v21.0/{WABA_ID}/subscribed_apps" \
+  -H "Authorization: Bearer {WHATSAPP_ACCESS_TOKEN}" \
+  -H "Content-Type: application/json"
+```
+
+O mediante un script rápido con Node.js:
+
+```javascript
+const token = process.env.WHATSAPP_ACCESS_TOKEN;
+const wabaId = "3148800701982517"; // Tu WhatsApp Business Account ID
+
+await fetch(`https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json"
+  }
+});
+```
+
+**Respuesta exitosa de Meta:**
+```json
+{
+  "success": true
+}
+```
+
+Al consultar la lista (`GET /{WABA_ID}/subscribed_apps`), la App `CHATBOT IA TEST` queda formalmente enlazada a la recepción de eventos del número telefónico.
+
+---
+
+## 8. Verificación y Pruebas Automatizadas
+
+Se creó el script de pruebas de integración [`scripts/test-whatsapp.ts`](../scripts/test-whatsapp.ts), ejecutable con:
+
+```bash
+npm run test:whatsapp
+```
+
+### Resultados de la Suite de Pruebas:
+* 1️⃣ **Handshake GET:** Valida respuesta 200 con `hub.challenge` ante tokens correctos.
+* 2️⃣ **Seguridad GET:** Valida rechazo con código 403 ante tokens no autorizados.
+* 3️⃣ **Filtro de Estado POST:** Valida que eventos `delivered`/`read` respondan 200 sin invocar modelos LLM.
+* 4️⃣ **Procesamiento RAG POST:** Valida extracción del texto de la pregunta, consulta semántica a Supabase y generación de respuesta limpia en texto plano con Gemini.
+* 5️⃣ **Idempotencia POST:** Valida que reenviar el mismo `wamid` devuelva `{ status: "already_processed" }` sin duplicar respuestas.
+
+---
+
+## 9. Lista de Comprobación para Nuevos Entornos
+
+Si en el futuro se despliega en producción (Vercel) o se cambia de número:
+1. [ ] Definir `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` y `WHATSAPP_VERIFY_TOKEN` en variables de entorno.
+2. [ ] Configurar la URL pública de producción (`https://tu-dominio.vercel.app/api/whatsapp`) en el Webhook de Meta.
+3. [ ] Suscribir el campo `messages` en la tabla de Webhooks.
+4. [ ] Ejecutar `POST /{WABA_ID}/subscribed_apps` para garantizar que la WABA envíe los eventos a la App.
+5. [ ] Para producción permanente: generar un **Token de Usuario de Sistema** con permisos `whatsapp_business_messaging` en [business.facebook.com/settings](https://business.facebook.com/settings) para que el token no expire cada 24 horas.
